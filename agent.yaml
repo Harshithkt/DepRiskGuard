@@ -1,0 +1,68 @@
+name: depriskguard
+
+description: >
+  An AI agent that forecasts which npm dependencies will become risky in the next 6
+  months, recommends a safer alternative, and generates the migration code diff.
+
+problem: >
+  Existing SCA tools (Snyk, Mend.io, Endor Labs, Socket.dev, OSV-Scanner, Dependabot)
+  are reactive and CVE-anchored — they tell you a package is ALREADY vulnerable or
+  ALREADY abandoned, and none of them connect a forward-looking risk verdict to the
+  code that gets you off the package.
+
+wedge: >
+  One pipeline: 6-month forward RISK FORECAST -> ranked ALTERNATIVE package ->
+  migration CODE DIFF, in a single flow.
+
+base_repo: >
+  none (built from scratch; references GitHub REST API, OSV.dev, and the npm registry
+  as data sources)
+
+model: >
+  Pluggable, selected with LLM_PROVIDER in .env. "anthropic" = Claude via the
+  Anthropic API (claude-opus-5, the default). "nebius" = an open-weight model via
+  Nebius AI Studio's OpenAI-compatible endpoint (model set with NEBIUS_MODEL).
+  Note that Nebius does not serve Claude — the two providers are alternatives.
+
+tech_stack:
+  backend: FastAPI + LangChain + Python 3.11
+  frontend: React + Vite + TypeScript + Tailwind CSS
+
+signals:
+  - Days since last GitHub commit
+  - Days since last npm release
+  - GitHub community health_percentage score
+  - Number of open vulnerabilities from OSV.dev
+  - Weekly npm download count
+
+endpoints:
+  - POST /analyze — accepts package.json content (or a list of {name, version}),
+    returns a risk report per dependency with an alternative where one is mapped
+  - POST /migrate — accepts a moment-based code snippet, returns a before/after
+    diff plus an explanation
+
+how_to_run:
+  backend: |
+    cd depriskguard-backend
+    python3.11 -m venv .venv
+    .venv/bin/pip install -r requirements.txt
+    cp .env.example .env      # then add your ANTHROPIC_API_KEY
+    .venv/bin/python -m uvicorn main:app --reload --port 8000
+  frontend: |
+    cd depriskguard-frontend
+    npm install
+    npm run dev               # http://localhost:5173
+
+env:
+  - LLM_PROVIDER ("anthropic" or "nebius")
+  - ANTHROPIC_API_KEY (required when LLM_PROVIDER=anthropic)
+  - NEBIUS_API_KEY + NEBIUS_MODEL (required when LLM_PROVIDER=nebius)
+  - GITHUB_TOKEN (optional, for higher GitHub API rate limits)
+
+scope_notes: >
+  This is a 2-day proof-of-concept. Risk forecasting uses LLM reasoning over 5 real
+  signals (GitHub activity, OSV vulnerabilities, npm download trends), not a trained
+  ML model. Alternative recommendations use a small hardcoded lookup table, not dynamic
+  discovery. Migration demo is limited to the moment -> date-fns package pair for
+  reliability. npm is the only supported ecosystem. No Docker, no MCP server, no
+  sandboxing, no public tunnel — it runs locally with two terminal commands.

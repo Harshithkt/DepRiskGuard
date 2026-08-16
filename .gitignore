@@ -1,0 +1,142 @@
+# ---------------------------------------------------------------------------
+# Secrets and credentials
+# ---------------------------------------------------------------------------
+# Every .env variant, including editor/tool backups (.env.bak, .env.save,
+# .env~) and per-machine overrides (.env.local, .env.production). The plain
+# `.env` rule alone does NOT cover these — a .env.bak holding a live key is
+# exactly how keys get committed by accident.
+.env
+.env.*
+*.env
+!.env.example
+!.env.sample
+!.env.template
+
+# Private keys and certificates
+*.pem
+*.key
+*.crt
+*.cer
+*.der
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+*.ppk
+
+# Registry / package-manager auth
+.npmrc
+.yarnrc
+.pypirc
+.netrc
+
+# Cloud provider credentials
+.aws/
+.azure/
+.gcloud/
+gcloud-service-key.json
+service-account*.json
+*-service-account.json
+client_secret*.json
+
+# Secret/credential data files. Deliberately scoped to data extensions rather
+# than a bare *secrets* glob — that would also swallow source files such as
+# secrets_manager.py, and a silently ignored source file is very hard to spot.
+credentials
+credentials.json
+credentials.yaml
+credentials.yml
+.credentials
+secrets.json
+secrets.yaml
+secrets.yml
+secrets.txt
+secrets.ini
+*.secret
+*.secrets
+
+# Generic key/token drops
+*token*.txt
+*apikey*.txt
+*api_key*.txt
+
+# ---------------------------------------------------------------------------
+# Python (backend)
+# ---------------------------------------------------------------------------
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.ipynb_checkpoints/
+
+# ---------------------------------------------------------------------------
+# Node / Vite (frontend)
+# ---------------------------------------------------------------------------
+node_modules/
+dist/
+dist-ssr/
+build/
+.vite/
+coverage/
+.eslintcache
+.npm/
+.yarn/
+.pnp.*
+*.local
+
+# ---------------------------------------------------------------------------
+# Logs and temp files
+# ---------------------------------------------------------------------------
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+*.pid
+*.seed
+*.bak
+*.backup
+*.orig
+*.tmp
+*.swp
+*.swo
+*~
+
+# ---------------------------------------------------------------------------
+# OS and editor
+# ---------------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+desktop.ini
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

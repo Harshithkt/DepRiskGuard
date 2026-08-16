@@ -1,0 +1,42 @@
+@import "tailwindcss";
+
+/* Claude-inspired light palette: warm paper canvas, clay accent, ink text.
+   Declared as Tailwind v4 theme tokens so they generate real utilities
+   (bg-canvas, text-ink, border-line, ...) instead of scattered hex values. */
+@theme {
+  --color-canvas: #faf9f5;
+  --color-surface: #ffffff;
+  --color-sunk: #f4f2ea;
+
+  --color-line: #e9e5da;
+  --color-line-strong: #d8d2c3;
+
+  --color-ink: #1f1e1d;
+  --color-ink-soft: #5c5952;
+  --color-ink-faint: #8b877e;
+
+  --color-clay: #d97757;
+  --color-clay-deep: #bf5c3c;
+  --color-clay-tint: #fbf1ec;
+
+  --color-low: #2f6a46;
+  --color-low-bg: #eaf3ed;
+  --color-low-line: #cfe3d7;
+
+  --color-mid: #8a5d18;
+  --color-mid-bg: #fdf3e2;
+  --color-mid-line: #f0dfbe;
+
+  --color-high: #a03d22;
+  --color-high-bg: #fbeae5;
+  --color-high-line: #f2d2c7;
+
+  --font-display: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, ui-serif, serif;
+}
+
+body {
+  margin: 0;
+  background: var(--color-canvas);
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
