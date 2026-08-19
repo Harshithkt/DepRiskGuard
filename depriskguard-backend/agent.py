@@ -1,9 +1,13 @@
 """LLM reasoning: risk forecast, alternative lookup, migration diff.
 
-Supports two providers, selected with LLM_PROVIDER in .env:
+Supports three providers, selected with LLM_PROVIDER in .env:
 
   anthropic  -> Claude via the Anthropic API (the default)
+  openai     -> GPT via the OpenAI API
   nebius     -> an open-weight model via Nebius's OpenAI-compatible endpoint
+
+openai and nebius share the same client: Nebius exposes an OpenAI-compatible
+endpoint, so the only difference is the base URL.
 
 The risk score is a deterministic rubric over real signals, adjusted by at most
 ADJUSTMENT_BAND points by the LLM — NOT a trained ML model. See README.md for the
@@ -24,8 +28,23 @@ load_dotenv()
 PROVIDER = os.getenv("LLM_PROVIDER", "anthropic").strip().lower()
 
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-opus-5")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
+# Optional: point at an OpenAI-compatible gateway or proxy. Empty = api.openai.com.
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "").strip()
 NEBIUS_MODEL = os.getenv("NEBIUS_MODEL", "")
 NEBIUS_BASE_URL = os.getenv("NEBIUS_BASE_URL", "https://api.studio.nebius.ai/v1/")
+
+# Without an explicit timeout these clients wait indefinitely, so one stalled
+# provider request hangs /analyze forever with no error to show the user. Observed
+# in practice: a Nebius model whose /models endpoint answered in 0.6s while
+# completions stopped responding entirely.
+LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "120"))
+
+# OpenAI's reasoning models (o-series, gpt-5 family) accept only the default
+# temperature and reject an explicit one outright, so temperature is omitted for
+# them and set to 0 everywhere else — repeated runs of the same package should
+# produce the same score.
+REASONING_MODEL = re.compile(r"^(o\d|gpt-5)", re.IGNORECASE)
 
 
 # --- Structured output schemas -------------------------------------------------
@@ -124,6 +143,24 @@ def get_curated_alternative(package_name: str) -> dict | None:
 # --- Provider wiring -----------------------------------------------------------
 
 
+def _openai_compatible(model: str, api_key: str | None, max_tokens: int, base_url: str | None):
+    """Chat client for OpenAI and any OpenAI-compatible endpoint (Nebius, gateways)."""
+    from langchain_openai import ChatOpenAI
+
+    kwargs: dict = {
+        "model": model,
+        "api_key": api_key,
+        "max_tokens": max_tokens,
+        "timeout": LLM_TIMEOUT_SECONDS,
+        "max_retries": 1,
+    }
+    if base_url:
+        kwargs["base_url"] = base_url
+    if not REASONING_MODEL.match(model):
+        kwargs["temperature"] = 0
+    return ChatOpenAI(**kwargs)
+
+
 def _build_llm(max_tokens: int, disable_thinking: bool):
     """Return a chat model for the configured provider."""
     if PROVIDER == "anthropic":
@@ -131,12 +168,27 @@ def _build_llm(max_tokens: int, disable_thinking: bool):
             raise RuntimeError("LLM_PROVIDER=anthropic but ANTHROPIC_API_KEY is not set in .env")
         from langchain_anthropic import ChatAnthropic
 
-        kwargs = {"model": ANTHROPIC_MODEL, "max_tokens": max_tokens}
+        kwargs = {
+            "model": ANTHROPIC_MODEL,
+            "max_tokens": max_tokens,
+            "timeout": LLM_TIMEOUT_SECONDS,
+            "max_retries": 1,
+        }
         if disable_thinking:
             # Scoring 5 numbers is a simple judgment and runs once per dependency,
             # so latency matters more than depth. Anthropic-specific parameter.
             kwargs["thinking"] = {"type": "disabled"}
         return ChatAnthropic(**kwargs)
+
+    if PROVIDER == "openai":
+        if not os.getenv("OPENAI_API_KEY"):
+            raise RuntimeError("LLM_PROVIDER=openai but OPENAI_API_KEY is not set in .env")
+        return _openai_compatible(
+            model=OPENAI_MODEL,
+            api_key=os.getenv("OPENAI_API_KEY"),
+            max_tokens=max_tokens,
+            base_url=OPENAI_BASE_URL or None,
+        )
 
     if PROVIDER == "nebius":
         if not os.getenv("NEBIUS_API_KEY"):
@@ -146,17 +198,16 @@ def _build_llm(max_tokens: int, disable_thinking: bool):
                 "LLM_PROVIDER=nebius but NEBIUS_MODEL is not set in .env "
                 "(e.g. NEBIUS_MODEL=Qwen/Qwen3-235B-A22B)"
             )
-        from langchain_openai import ChatOpenAI
-
-        return ChatOpenAI(
+        return _openai_compatible(
             model=NEBIUS_MODEL,
             api_key=os.getenv("NEBIUS_API_KEY"),
-            base_url=NEBIUS_BASE_URL,
             max_tokens=max_tokens,
-            temperature=0,
+            base_url=NEBIUS_BASE_URL,
         )
 
-    raise RuntimeError(f"Unknown LLM_PROVIDER '{PROVIDER}'. Use 'anthropic' or 'nebius'.")
+    raise RuntimeError(
+        f"Unknown LLM_PROVIDER '{PROVIDER}'. Use 'anthropic', 'openai' or 'nebius'."
+    )
 
 
 async def _invoke_structured(schema: type[BaseModel], prompt: str, max_tokens: int, disable_thinking: bool):

@@ -3,6 +3,10 @@
 Paste a `package.json`, get a **6-month forward risk forecast** for every dependency and a
 **recommended alternative** for the risky ones.
 
+> **Setting it up?** See **[GUIDE.md](GUIDE.md)** — prerequisites, provider keys, run
+> commands, verification and troubleshooting. This README covers what the tool does
+> and how the scoring works.
+
 ## What it does, in plain language
 
 Tools like Snyk, Dependabot and OSV-Scanner tell you a package is *already* broken —
@@ -112,18 +116,31 @@ cp .env.example .env      # then fill in a provider + key (see below)
 
 ### Choosing an LLM provider
 
-The backend runs against either Claude or an open-weight model on Nebius. Set
+The backend runs against Claude, OpenAI, or an open-weight model on Nebius. Set
 `LLM_PROVIDER` in `.env`:
 
 | `LLM_PROVIDER` | Needs | Notes |
 | --- | --- | --- |
 | `anthropic` | `ANTHROPIC_API_KEY` | Claude via the Anthropic API. Default. Uses native structured outputs and disables thinking on the risk call for speed. |
+| `openai` | `OPENAI_API_KEY` | GPT via the OpenAI API. `OPENAI_MODEL` defaults to `gpt-4o`; set `OPENAI_BASE_URL` to route through a compatible gateway or proxy. |
 | `nebius` | `NEBIUS_API_KEY`, `NEBIUS_MODEL` | An open-weight model (Qwen, Llama, DeepSeek…) via Nebius's OpenAI-compatible endpoint. `NEBIUS_MODEL` must match Nebius's own naming, e.g. `Qwen/Qwen3-235B-A22B`. |
 
-> **Nebius does not serve Claude.** Anthropic's models run on the Anthropic API,
-> Claude Platform on AWS, Amazon Bedrock, Google Cloud and Microsoft Foundry —
-> Nebius isn't one of them. These are two alternative providers, not two routes to
-> the same model, so expect different output quality and phrasing between them.
+`openai` and `nebius` share one client — Nebius serves an OpenAI-compatible API, so
+the only real difference is the base URL.
+
+> **Neither OpenAI nor Nebius serves Claude.** Anthropic's models run on the
+> Anthropic API, Claude Platform on AWS, Amazon Bedrock, Google Cloud and Microsoft
+> Foundry — neither of these is one of them. These are three alternative providers,
+> not three routes to the same model, so expect different output quality and phrasing
+> between them.
+
+**A note on OpenAI reasoning models.** `o3`, `o4-mini` and the `gpt-5` family reject
+an explicit `temperature`, so the code omits it for them and pins `temperature=0`
+everywhere else (repeated runs of the same package should produce the same score).
+They also spend reasoning tokens out of the same `max_tokens` budget the answer draws
+on — the risk call allocates 1500, which a reasoning model can consume entirely
+before writing any output, producing an empty or truncated result. For this workload
+a standard chat model such as `gpt-4o` is both cheaper and more predictable.
 
 Structured output adapts to the provider: it tries the native mechanism first
 (Anthropic `output_config.format` / OpenAI-compatible `response_format`) and falls
@@ -132,8 +149,11 @@ they support schema-guided decoding.
 
 | Key | Required | Why |
 | --- | --- | --- |
-| `LLM_PROVIDER` | yes | `anthropic` or `nebius` |
+| `LLM_PROVIDER` | yes | `anthropic`, `openai` or `nebius` |
 | `ANTHROPIC_API_KEY` | if anthropic | All Claude calls |
+| `OPENAI_API_KEY` | if openai | All GPT calls |
+| `OPENAI_MODEL` | no | Defaults to `gpt-4o`. Any chat model your account can reach. |
+| `OPENAI_BASE_URL` | no | Defaults to OpenAI's own host. Set it to use a compatible gateway. |
 | `NEBIUS_API_KEY` / `NEBIUS_MODEL` | if nebius | Key and the model you've enabled |
 | `NEBIUS_BASE_URL` | no | Defaults to `https://api.studio.nebius.ai/v1/`. Override if Nebius moves the host — they're rebranding to "Token Factory". |
 | `GITHUB_TOKEN` | no | Strongly recommended. Unauthenticated GitHub allows ~60 req/hr and DepRiskGuard makes 3 calls per package, so you'll hit the limit after ~20 packages and start losing signals (which lowers scores — see scope notes). A token with no scopes raises this to 5,000/hr. |
