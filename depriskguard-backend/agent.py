@@ -1,4 +1,4 @@
-"""LLM reasoning: risk forecast, alternative lookup, migration diff.
+"""LLM reasoning: package risk forecast, repository health, alternative lookup.
 
 Supports three providers, selected with LLM_PROVIDER in .env:
 
@@ -74,13 +74,6 @@ class AlternativeSuggestion(BaseModel):
     """Ranked replacement candidates for a risky package."""
 
     candidates: list[AlternativeCandidate] = Field(description="Up to 3 candidates, best first. Return an empty list if the package is genuinely best-in-class and no replacement would be an improvement.")
-
-
-class MigrationResult(BaseModel):
-    """A moment -> date-fns migration of a user-supplied code snippet."""
-
-    diff: str = Field(description="Unified diff (---/+++/@@ with -/+ lines) transforming the moment code into date-fns code.")
-    explanation: str = Field(description="Short plain-language explanation of what changed and why.")
 
 
 # --- Curated alternatives ------------------------------------------------------
@@ -417,25 +410,6 @@ Write both as plain prose. No markdown, no **bold**, no bullet points, no headin
 no line breaks."""
 
 
-MIGRATION_PROMPT = """Rewrite this JavaScript/TypeScript code to replace moment with date-fns.
-
-Rules:
-- Import only the date-fns functions actually used, e.g. `import {{ format, addDays }} from 'date-fns'`.
-- moment is mutable and chainable; date-fns is immutable and functional. Restructure \
-chained calls into nested or sequential function calls.
-- Convert moment format tokens to date-fns tokens (they differ): moment `YYYY-MM-DD` \
-becomes date-fns `yyyy-MM-dd`, moment `DD` becomes `dd`, moment `HH:mm` stays `HH:mm`.
-- Preserve the original logic and variable names. Do not add features.
-- If part of the snippet does not use moment, leave it unchanged.
-
-Return a unified diff (with ---, +++, @@ headers and -/+ lines) plus a short explanation.
-
-Code to migrate:
-```javascript
-{snippet}
-```"""
-
-
 def _fmt(value) -> str:
     return "unknown" if value is None else str(value)
 
@@ -637,17 +611,6 @@ async def suggest_alternative(client, name: str, version: str, risk: dict) -> di
 
     # Every proposal failed its check, or the model had nothing to offer.
     return {"alternative_none": True, "considered": considered} if considered else None
-
-
-async def generate_migration(snippet: str) -> MigrationResult:
-    """One LLM call rewriting a moment snippet to date-fns.
-
-    Thinking is left on (adaptive) for Anthropic here — rewriting code genuinely
-    benefits from reasoning, and this is a single on-demand call.
-    """
-    return await _invoke_structured(
-        MigrationResult, MIGRATION_PROMPT.format(snippet=snippet), max_tokens=8000, disable_thinking=False
-    )
 
 
 # --- Repository health ---------------------------------------------------------

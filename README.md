@@ -129,7 +129,7 @@ The backend runs against Claude, OpenAI, or an open-weight model on Nebius. Set
 
 | `LLM_PROVIDER` | Needs | Notes |
 | --- | --- | --- |
-| `anthropic` | `ANTHROPIC_API_KEY` | Claude via the Anthropic API. Default. Uses native structured outputs and disables thinking on the risk call for speed. |
+| `anthropic` | `ANTHROPIC_API_KEY` | Claude via the Anthropic API. Default. Uses native structured outputs and disables thinking on the scoring calls for speed. |
 | `openai` | `OPENAI_API_KEY` | GPT via the OpenAI API. `OPENAI_MODEL` defaults to `gpt-4o`; set `OPENAI_BASE_URL` to route through a compatible gateway or proxy. |
 | `nebius` | `NEBIUS_API_KEY`, `NEBIUS_MODEL` | An open-weight model (Qwen, Llama, DeepSeek…) via Nebius's OpenAI-compatible endpoint. `NEBIUS_MODEL` must match Nebius's own naming, e.g. `Qwen/Qwen3-235B-A22B`. |
 
@@ -211,13 +211,10 @@ curl -X POST http://127.0.0.1:8000/analyze-repo \
   -H 'Content-Type: application/json' \
   -d '{"repo_url": "expressjs/express", "include_dependencies": false}'
 
-# Migration diff
-curl -X POST http://127.0.0.1:8000/migrate \
-  -H 'Content-Type: application/json' \
-  -d '{"code": "const m = require(\"moment\"); m().format(\"YYYY-MM-DD\");"}'
 ```
 
-There's also a smoke test that exercises both endpoints with a realistic payload:
+There's also a smoke test that exercises both endpoints against live data — a pasted
+manifest, a healthy repository, and an abandoned one:
 
 ```bash
 cd depriskguard-backend
@@ -230,7 +227,7 @@ cd depriskguard-backend
 agent.yaml                     # the deliverable config
 README.md
 depriskguard-backend/
-  main.py                      # FastAPI app, CORS, /analyze + /analyze-repo + /migrate
+  main.py                      # FastAPI app, CORS, /analyze + /analyze-repo
   signals.py                   # raw signals from GitHub / npm / OSV, package + repository
   agent.py                     # risk rubric, health rubric, alternatives agent, providers
   test_api.py                  # end-to-end smoke test
@@ -250,10 +247,11 @@ depriskguard-frontend/
   `tool_choice`. If the call raises (common for open-weight models that don't implement
   schema-guided decoding), it falls back to prompt-instructed JSON plus
   `PydanticOutputParser`, which works on any chat model.
-- On Anthropic, thinking is **disabled** for the risk call — scoring 5 numbers is a simple
-  judgment that runs once per dependency, so latency matters more than depth. It's left on
-  (adaptive, the Opus 5 default) for the migration call, where rewriting code genuinely
-  benefits from reasoning. The parameter is Anthropic-specific and is not sent to Nebius.
+- On Anthropic, thinking is **disabled** for the risk and health calls — both start from a
+  computed rubric and only adjust it, so latency matters more than depth, and the risk call
+  runs once per dependency. It's left on (adaptive, the Opus 5 default) for the alternative
+  agent, which has to reason about what a package actually does before proposing a
+  replacement. The parameter is Anthropic-specific and is not sent to Nebius.
 - The rubric lives in `baseline_risk` (`agent.py`) and returns its own itemised
   breakdown, which is what both the API response and the UI render. Adding or reweighting
   a factor is a one-line change there, and the effect is visible in the breakdown without

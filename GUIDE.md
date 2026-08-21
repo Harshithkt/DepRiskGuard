@@ -115,9 +115,9 @@ curl -s https://api.studio.nebius.ai/v1/models \
   -H "Authorization: Bearer $NEBIUS_API_KEY" | grep -o '"id":"[^"]*"'
 ```
 
-> Expect noticeably more junk output from small open-weight models — malformed
-> migration diffs, and occasional irrelevant alternative suggestions that pass the
-> npm health check because they are real and maintained but unrelated.
+> Expect noticeably more junk output from small open-weight models — placeholder
+> text where prose was asked for, and occasional irrelevant alternative suggestions
+> that pass the npm health check because they are real and maintained but unrelated.
 
 ### Optional, all providers
 
@@ -219,7 +219,7 @@ cd depriskguard-backend
 .venv/bin/python test_api.py
 ```
 
-Exercises `/analyze` and `/migrate` with a realistic payload and prints the full
+Exercises `/analyze` and `/analyze-repo` against live data and prints the full
 rubric breakdown and alternative for every package.
 
 ### Health check
@@ -241,10 +241,10 @@ curl -X POST http://127.0.0.1:8000/analyze \
   -H 'Content-Type: application/json' \
   -d '{"dependencies":[{"name":"moment","version":"^2.29.4"}]}'
 
-# moment -> date-fns migration diff (not surfaced in the UI, endpoint still live)
-curl -X POST http://127.0.0.1:8000/migrate \
+# Repository health report (higher is better — the inverse of the risk scores above)
+curl -X POST http://127.0.0.1:8000/analyze-repo \
   -H 'Content-Type: application/json' \
-  -d '{"code": "const m = require(\"moment\"); m().format(\"YYYY-MM-DD\");"}'
+  -d '{"repo_url": "https://github.com/expressjs/express"}'
 ```
 
 Interactive API docs: <http://127.0.0.1:8000/docs>
@@ -376,7 +376,7 @@ GUIDE.md                       # this file
 README.md                      # what it does and how scoring works
 agent.yaml
 depriskguard-backend/
-  main.py                      # FastAPI app, CORS, /analyze + /migrate
+  main.py                      # FastAPI app, CORS, /analyze + /analyze-repo
   signals.py                   # raw signals from GitHub / npm / OSV, + npm health check
   agent.py                     # scoring rubric, alternatives agent, provider wiring
   test_api.py                  # end-to-end smoke test

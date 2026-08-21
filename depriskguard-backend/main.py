@@ -1,4 +1,4 @@
-"""DepRiskGuard API — 2 endpoints: POST /analyze and POST /migrate."""
+"""DepRiskGuard API — 2 endpoints: POST /analyze and POST /analyze-repo."""
 
 import asyncio
 import json
@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from agent import assess_repo_health, assess_risk, generate_migration, suggest_alternative
+from agent import assess_repo_health, assess_risk, suggest_alternative
 from signals import collect_repo_signals, collect_signals, parse_repo_input
 
 app = FastAPI(title="DepRiskGuard", version="0.1.0")
@@ -35,10 +35,6 @@ class Dependency(BaseModel):
 class AnalyzeRequest(BaseModel):
     package_json: str | None = None
     dependencies: list[Dependency] | None = None
-
-
-class MigrateRequest(BaseModel):
-    code: str
 
 
 class RepoRequest(BaseModel):
@@ -124,18 +120,6 @@ async def analyze(req: AnalyzeRequest):
 
     ranked = sorted(results, key=lambda r: r.get("risk_score", -1), reverse=True)
     return {"analyzed": len(ranked), "results": ranked}
-
-
-@app.post("/migrate")
-async def migrate(req: MigrateRequest):
-    """moment -> date-fns migration demo. This is the only supported pair."""
-    if not req.code.strip():
-        raise HTTPException(status_code=400, detail="Code snippet is empty.")
-    try:
-        result = await generate_migration(req.code)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
-    return {"diff": result.diff, "explanation": result.explanation}
 
 
 # A repo's package.json is frequently much larger than a hand-pasted one — Express

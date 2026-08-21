@@ -1,4 +1,9 @@
-"""End-to-end smoke test. Start the server first, then: .venv/bin/python test_api.py"""
+"""End-to-end smoke test. Start the server first, then: .venv/bin/python test_api.py
+
+Exercises both endpoints against live data: /analyze on a hand-written manifest,
+and /analyze-repo on a repository known to be abandoned, so the maintenance
+ceiling and the inverted health scale both get covered rather than assumed.
+"""
 
 import json
 
@@ -19,20 +24,11 @@ SAMPLE_PACKAGE_JSON = json.dumps(
     }
 )
 
-SAMPLE_SNIPPET = """const moment = require('moment');
-
-function formatDueDate(task) {
-  return moment(task.dueDate).format('YYYY-MM-DD');
-}
-
-function isOverdue(task) {
-  return moment(task.dueDate).isBefore(moment());
-}
-
-function reminderDate(task) {
-  return moment(task.dueDate).subtract(3, 'days').format('MMM DD, YYYY');
-}
-"""
+# Deliberately a dead repository: `request` is deprecated with no commit in years,
+# which is the case where the health rubric has to override its own weighted mean.
+# A healthy repo would exercise none of that.
+SAMPLE_REPO = "expressjs/express"
+ABANDONED_REPO = "request/request"
 
 
 def main() -> None:
@@ -81,14 +77,36 @@ def main() -> None:
                 if alt.get("considered"):
                     print(f"    reject: {alt['considered']}")
 
-        print("\n" + "=" * 70)
-        print("POST /migrate")
-        print("=" * 70)
-        r = client.post(f"{BASE}/migrate", json={"code": SAMPLE_SNIPPET})
-        r.raise_for_status()
-        data = r.json()
-        print(data["diff"])
-        print("\nExplanation:", data["explanation"])
+        for repo in (SAMPLE_REPO, ABANDONED_REPO):
+            print("\n" + "=" * 70)
+            print(f"POST /analyze-repo  —  {repo}")
+            print("=" * 70)
+            r = client.post(
+                f"{BASE}/analyze-repo",
+                json={"repo_url": repo, "include_dependencies": False},
+            )
+            r.raise_for_status()
+            d = r.json()
+            delta = d["health_score"] - d["baseline_score"]
+            print(
+                f"\n{d['repo']:<22} {d['health_category']:<10} health={d['health_score']}/100"
+                f"  (rubric baseline {d['baseline_score']}, model {delta:+d})"
+            )
+            for pillar in d["pillars"]:
+                pct = "no data" if pillar["percentage"] is None else f"{pillar['percentage']}%"
+                print(f"  {pillar['label']:<12} {pct:>8}  ({pillar['earned']}/{pillar['available']})")
+                for item in pillar["items"]:
+                    points = "   ?" if item["points"] is None else f"{item['points']:>2}/{item['max']:<2}"
+                    print(f"      {points}  {item['reason']}")
+            if d["ceiling_note"]:
+                print(f"  CEILING:  {d['ceiling_note']}")
+            print(f"  summary:  {d['summary']}")
+            print(f"  outlook:  {d['outlook']}")
+            for good in d["strengths"]:
+                print(f"    +  {good}")
+            for bad in d["concerns"]:
+                print(f"    -  {bad}")
+            print(f"  why:      {d['justification']}")
 
 
 if __name__ == "__main__":

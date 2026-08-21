@@ -2,7 +2,7 @@ name: depriskguard
 
 description: >
   An AI agent that forecasts which npm dependencies will become risky in the next 6
-  months, recommends a safer alternative, and generates the migration code diff.
+  months, scores the health of a whole repository, and recommends a safer alternative.
 
 problem: >
   Existing SCA tools (Snyk, Mend.io, Endor Labs, Socket.dev, OSV-Scanner, Dependabot)
@@ -11,8 +11,9 @@ problem: >
   code that gets you off the package.
 
 wedge: >
-  One pipeline: 6-month forward RISK FORECAST -> ranked ALTERNATIVE package ->
-  migration CODE DIFF, in a single flow.
+  One pipeline: 6-month forward RISK FORECAST -> ranked ALTERNATIVE package, run
+  either over a pasted package.json or over a whole repository scored for HEALTH,
+  in a single flow.
 
 base_repo: >
   none (built from scratch; references GitHub REST API, OSV.dev, and the npm registry
@@ -49,8 +50,6 @@ endpoints:
     owner/repo), returns a 0-100 repository HEALTH score (higher is better, the
     inverse of the risk scale), a four-pillar breakdown, strengths and concerns,
     and the risk report for the dependencies in its package.json
-  - POST /migrate — accepts a moment-based code snippet, returns a before/after
-    diff plus an explanation
 
 how_to_run:
   backend: |
@@ -76,6 +75,5 @@ scope_notes: >
   ML model. Repository health uses the same shape — a fixed four-pillar rubric with a
   bounded model adjustment — and deliberately excludes unmeasurable signals from its
   denominator so an API outage cannot read as neglect. Alternative recommendations use a
-  small hardcoded lookup table, not dynamic discovery. Migration demo is limited to the moment -> date-fns package pair for
-  reliability. npm is the only supported ecosystem. No Docker, no MCP server, no
+  small hardcoded lookup table, not dynamic discovery. npm is the only supported ecosystem. No Docker, no MCP server, no
   sandboxing, no public tunnel — it runs locally with two terminal commands.
