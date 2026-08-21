@@ -14,9 +14,11 @@ Any signal may be None when a source is unavailable; nothing downstream treats
 None as bad.
 """
 
+import base64
+import json
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from dotenv import load_dotenv
@@ -24,6 +26,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+
+# Window for the commit-throughput signal. A quarter is long enough to survive a
+# holiday lull without smoothing away a genuine stop.
+COMMIT_WINDOW_DAYS = 90
 
 NPM_REGISTRY = "https://registry.npmjs.org"
 NPM_DOWNLOADS = "https://api.npmjs.org/downloads/point/last-week"
@@ -334,4 +340,370 @@ async def collect_signals(client: httpx.AsyncClient, name: str, version: str) ->
         "resolved_version": resolved_version,
         "latest_version": npm["latest_version"],
         "github_repo": "/".join(npm["repo"]) if npm["repo"] else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Repository-level signals
+#
+# Everything above scores a *package* for risk. Everything below scores a
+# *repository* for health, which is the same data viewed from the other end:
+# risk asks "will this hurt me", health asks "is this well kept".
+#
+# One invariant flips with the direction, and it matters. The package rubric can
+# safely let a missing signal contribute nothing, because 0 points there means
+# "no risk found" — the benign reading. On a health score 0 points means "no
+# credit earned", which is the *hostile* reading, so an unreachable API would
+# silently look like a badly run project. Every fetch below therefore reports
+# which signals it actually obtained, and baseline_health scores earned-out-of-
+# available rather than earned-out-of-total. See _Pillar in agent.py.
+# ---------------------------------------------------------------------------
+
+
+# Repo URLs arrive pasted from a browser, cloned from a terminal, or typed by hand.
+_REPO_PATTERNS = (
+    # git@github.com:owner/repo.git
+    re.compile(r"^git@github\.com:([^/]+)/([^/]+?)(?:\.git)?/?$", re.IGNORECASE),
+    # https://github.com/owner/repo[/tree/main/...][.git][/]
+    re.compile(r"^(?:https?://)?(?:www\.)?github\.com/([^/]+)/([^/?#]+?)(?:\.git)?(?:[/?#].*)?$", re.IGNORECASE),
+    # bare owner/repo
+    re.compile(r"^([A-Za-z0-9][\w.-]*)/([\w.-]+?)(?:\.git)?/?$"),
+)
+
+
+def parse_repo_input(text: str) -> tuple[str, str] | None:
+    """Accept any of the shapes a GitHub repo gets copied in as -> ('owner', 'repo').
+
+    Handles the browser URL (including deep links like /tree/main/src), the SSH
+    clone string, the https clone string, and bare `owner/repo`. Returns None when
+    the input isn't a GitHub repo reference at all.
+    """
+    if not text:
+        return None
+    candidate = text.strip()
+    for pattern in _REPO_PATTERNS:
+        match = pattern.match(candidate)
+        if match:
+            owner, repo = match.group(1), match.group(2)
+            # "github.com/owner" alone, or a trailing path fragment mistaken for a repo.
+            if not owner or not repo or repo in (".", ".."):
+                return None
+            return owner, repo.removesuffix(".git")
+    return None
+
+
+def _count_from_link_header(link_header: str | None) -> int | None:
+    """Total item count from a paginated response fetched with per_page=1.
+
+    GitHub does not return totals, but with one item per page the last page number
+    *is* the total. Costs a single request instead of walking every page — the
+    difference between 1 call and 40 for a repo with 4,000 commits.
+    """
+    if not link_header:
+        return None
+    match = re.search(r'[?&]page=(\d+)>;\s*rel="last"', link_header)
+    return int(match.group(1)) if match else None
+
+
+async def _counted_get(client: httpx.AsyncClient, url: str, params: dict | None = None) -> int | None:
+    """Number of items behind a paginated GitHub collection endpoint."""
+    try:
+        r = await client.get(
+            url, params={**(params or {}), "per_page": 1}, headers=_github_headers(), timeout=TIMEOUT
+        )
+        if r.status_code != 200:
+            return None
+        total = _count_from_link_header(r.headers.get("Link"))
+        if total is not None:
+            return total
+        # No Link header means the collection fits on one page: 0 or 1 items.
+        body = r.json()
+        return len(body) if isinstance(body, list) else None
+    except (httpx.HTTPError, ValueError):
+        return None
+
+
+async def fetch_repo_profile(client: httpx.AsyncClient, owner: str, repo: str) -> dict:
+    """Core repo metadata: reach, licensing, and whether it is still open for business."""
+    out = {
+        "exists": None,
+        "full_name": None,
+        "description": None,
+        "language": None,
+        "topics": None,
+        "stars": None,
+        "forks": None,
+        "watchers": None,
+        "open_issues_and_prs": None,
+        "archived": None,
+        "disabled": None,
+        "is_fork": None,
+        "license": None,
+        "default_branch": None,
+        "days_since_last_push": None,
+        "age_days": None,
+    }
+    try:
+        r = await client.get(
+            f"{GITHUB_API}/repos/{owner}/{repo}", headers=_github_headers(), timeout=TIMEOUT
+        )
+        if r.status_code == 404:
+            out["exists"] = False
+            return out
+        if r.status_code != 200:
+            return out
+        data = r.json()
+    except (httpx.HTTPError, ValueError):
+        return out
+
+    out["exists"] = True
+    out["full_name"] = data.get("full_name")
+    out["description"] = (data.get("description") or "").strip() or None
+    out["language"] = data.get("language")
+    out["topics"] = data.get("topics") or []
+    out["stars"] = data.get("stargazers_count")
+    out["forks"] = data.get("forks_count")
+    out["watchers"] = data.get("subscribers_count")
+    # GitHub's open_issues_count folds in open PRs. Named honestly so the rubric
+    # never presents it as an issue backlog, which it is not.
+    out["open_issues_and_prs"] = data.get("open_issues_count")
+    out["archived"] = bool(data.get("archived"))
+    out["disabled"] = bool(data.get("disabled"))
+    out["is_fork"] = bool(data.get("fork"))
+    licence = data.get("license") or {}
+    # GitHub reports an unrecognised LICENSE file as spdx_id "NOASSERTION".
+    spdx = licence.get("spdx_id")
+    out["license"] = None if spdx in (None, "NOASSERTION") else spdx
+    out["default_branch"] = data.get("default_branch")
+    out["days_since_last_push"] = _days_since(data.get("pushed_at") or "")
+    out["age_days"] = _days_since(data.get("created_at") or "")
+    return out
+
+
+async def fetch_repo_activity(client: httpx.AsyncClient, owner: str, repo: str) -> dict:
+    """Commit throughput, contributor spread, and release cadence.
+
+    Commit *recency* says someone touched the repo; commit *volume over a window*
+    says whether that was a lone typo fix or ongoing work. Both are needed — a
+    single README commit yesterday should not read like an active project.
+    """
+    out = {
+        "days_since_last_commit": None,
+        "commits_last_90d": None,
+        "contributors": None,
+        "top_contributor_share": None,
+        "releases_total": None,
+        "days_since_last_release": None,
+    }
+    base = f"{GITHUB_API}/repos/{owner}/{repo}"
+
+    try:
+        r = await client.get(
+            f"{base}/commits", params={"per_page": 1}, headers=_github_headers(), timeout=TIMEOUT
+        )
+        if r.status_code == 200 and r.json():
+            out["days_since_last_commit"] = _days_since(
+                r.json()[0]["commit"]["committer"]["date"]
+            )
+    except (httpx.HTTPError, ValueError, KeyError, IndexError):
+        pass
+
+    window_start = (datetime.now(timezone.utc) - timedelta(days=COMMIT_WINDOW_DAYS)).isoformat()
+    out["commits_last_90d"] = await _counted_get(client, f"{base}/commits", {"since": window_start})
+
+    # anon=0 keeps the count to identifiable accounts; GitHub caps this list on very
+    # large repos, which understates rather than inflates — the safe direction.
+    out["contributors"] = await _counted_get(client, f"{base}/contributors", {"anon": "0"})
+
+    # Bus factor proxy: if one person authored nearly everything, the project has a
+    # single point of failure regardless of how healthy the activity graph looks.
+    try:
+        r = await client.get(
+            f"{base}/contributors",
+            params={"per_page": 30, "anon": "0"},
+            headers=_github_headers(),
+            timeout=TIMEOUT,
+        )
+        if r.status_code == 200:
+            people = r.json()
+            if isinstance(people, list) and people:
+                counts = [p.get("contributions") or 0 for p in people]
+                total = sum(counts)
+                if total > 0:
+                    out["top_contributor_share"] = round(max(counts) / total * 100)
+    except (httpx.HTTPError, ValueError):
+        pass
+
+    out["releases_total"] = await _counted_get(client, f"{base}/releases")
+    try:
+        r = await client.get(
+            f"{base}/releases/latest", headers=_github_headers(), timeout=TIMEOUT
+        )
+        if r.status_code == 200:
+            out["days_since_last_release"] = _days_since(r.json().get("published_at") or "")
+    except (httpx.HTTPError, ValueError):
+        pass
+
+    return out
+
+
+async def fetch_repo_governance(client: httpx.AsyncClient, owner: str, repo: str) -> dict:
+    """Which community files exist — the paperwork that tells contributors how to help."""
+    out = {
+        "community_health_percentage": None,
+        "has_readme": None,
+        "has_license_file": None,
+        "has_contributing": None,
+        "has_code_of_conduct": None,
+        "has_issue_template": None,
+        "has_pr_template": None,
+        "has_security_policy": None,
+    }
+    try:
+        r = await client.get(
+            f"{GITHUB_API}/repos/{owner}/{repo}/community/profile",
+            headers=_github_headers(),
+            timeout=TIMEOUT,
+        )
+        if r.status_code != 200:
+            return out
+        data = r.json()
+    except (httpx.HTTPError, ValueError):
+        return out
+
+    files = data.get("files") or {}
+    out["community_health_percentage"] = data.get("health_percentage")
+    out["has_readme"] = bool(files.get("readme"))
+    out["has_license_file"] = bool(files.get("license"))
+    out["has_contributing"] = bool(files.get("contributing"))
+    out["has_code_of_conduct"] = bool(files.get("code_of_conduct"))
+    out["has_issue_template"] = bool(files.get("issue_template"))
+    out["has_pr_template"] = bool(files.get("pull_request_template"))
+    out["has_security_policy"] = bool(files.get("security"))
+    return out
+
+
+async def fetch_issue_responsiveness(client: httpx.AsyncClient, owner: str, repo: str) -> dict:
+    """Median days to close, over the most recently updated closed issues.
+
+    A backlog count alone cannot separate a busy project from a neglected one —
+    popular repos always have open issues. How long it takes to *close* one is the
+    signal that actually distinguishes them.
+    """
+    out = {"median_issue_close_days": None, "closed_issues_sampled": None}
+    try:
+        r = await client.get(
+            f"{GITHUB_API}/repos/{owner}/{repo}/issues",
+            params={"state": "closed", "per_page": 50, "sort": "updated", "direction": "desc"},
+            headers=_github_headers(),
+            timeout=TIMEOUT,
+        )
+        if r.status_code != 200:
+            return out
+        items = r.json()
+    except (httpx.HTTPError, ValueError):
+        return out
+
+    if not isinstance(items, list):
+        return out
+
+    durations = []
+    for item in items:
+        # The issues endpoint returns pull requests too; they close on a different
+        # rhythm entirely and would skew the median.
+        if item.get("pull_request"):
+            continue
+        created, closed = item.get("created_at"), item.get("closed_at")
+        if not created or not closed:
+            continue
+        try:
+            opened_at = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            shut_at = datetime.fromisoformat(closed.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        durations.append(max(0, (shut_at - opened_at).days))
+
+    if not durations:
+        return out
+    durations.sort()
+    mid = len(durations) // 2
+    median = durations[mid] if len(durations) % 2 else (durations[mid - 1] + durations[mid]) // 2
+    out["median_issue_close_days"] = median
+    out["closed_issues_sampled"] = len(durations)
+    return out
+
+
+async def fetch_repo_manifest(client: httpx.AsyncClient, owner: str, repo: str) -> dict:
+    """The repo's package.json, so its dependencies can be run through the risk engine."""
+    out = {"manifest_found": False, "package_name": None, "dependencies": [], "manifest_error": None}
+    try:
+        r = await client.get(
+            f"{GITHUB_API}/repos/{owner}/{repo}/contents/package.json",
+            headers=_github_headers(),
+            timeout=TIMEOUT,
+        )
+        if r.status_code == 404:
+            out["manifest_error"] = "No package.json at the repository root."
+            return out
+        if r.status_code != 200:
+            out["manifest_error"] = f"GitHub returned {r.status_code} for package.json."
+            return out
+        payload = r.json()
+    except (httpx.HTTPError, ValueError):
+        out["manifest_error"] = "Could not reach GitHub for package.json."
+        return out
+
+    try:
+        raw = base64.b64decode(payload.get("content") or "").decode("utf-8")
+        data = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        out["manifest_error"] = "package.json exists but could not be decoded as JSON."
+        return out
+
+    out["manifest_found"] = True
+    out["package_name"] = data.get("name")
+    deps = []
+    for section in ("dependencies", "devDependencies"):
+        for name, version in (data.get(section) or {}).items():
+            deps.append({"name": name, "version": str(version), "dev": section == "devDependencies"})
+    out["dependencies"] = deps
+    return out
+
+
+async def collect_repo_signals(client: httpx.AsyncClient, owner: str, repo: str) -> dict:
+    """Every repository-level signal. Any value may be None if the source was unavailable."""
+    profile = await fetch_repo_profile(client, owner, repo)
+    if profile["exists"] is False:
+        return {**profile, "resolved_repo": f"{owner}/{repo}"}
+    if profile["exists"] is None:
+        return {**profile, "resolved_repo": f"{owner}/{repo}"}
+
+    activity = await fetch_repo_activity(client, owner, repo)
+    governance = await fetch_repo_governance(client, owner, repo)
+    issues = await fetch_issue_responsiveness(client, owner, repo)
+    manifest = await fetch_repo_manifest(client, owner, repo)
+
+    # If the repo publishes to npm under a name, its own advisories are part of its
+    # security picture — not just the advisories of what it depends on.
+    #
+    # Pinned to the CURRENTLY PUBLISHED version deliberately. An unversioned OSV query
+    # returns every advisory ever filed against the package, so React came back with a
+    # stack of long-patched CVEs and scored 0% on security — punishing it for having
+    # existed long enough to fix things. What matters is what is unfixed *now*.
+    own_vulns = {"open_vulnerabilities": None, "max_vulnerability_severity": None}
+    published_version = None
+    if manifest.get("package_name"):
+        npm = await fetch_npm(client, manifest["package_name"])
+        published_version = npm["latest_version"]
+        own_vulns = await fetch_osv(client, manifest["package_name"], published_version)
+
+    return {
+        "resolved_repo": profile["full_name"] or f"{owner}/{repo}",
+        **profile,
+        **activity,
+        **governance,
+        **issues,
+        **manifest,
+        **own_vulns,
+        "published_version": published_version,
     }

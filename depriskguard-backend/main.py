@@ -8,8 +8,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from agent import assess_risk, generate_migration, suggest_alternative
-from signals import collect_signals
+from agent import assess_repo_health, assess_risk, generate_migration, suggest_alternative
+from signals import collect_repo_signals, collect_signals, parse_repo_input
 
 app = FastAPI(title="DepRiskGuard", version="0.1.0")
 
@@ -39,6 +39,14 @@ class AnalyzeRequest(BaseModel):
 
 class MigrateRequest(BaseModel):
     code: str
+
+
+class RepoRequest(BaseModel):
+    repo_url: str
+    # Reading a repo's own package.json is the point of passing a repo URL, but the
+    # dependency pass is the expensive half (one LLM call per package), so it stays
+    # switchable for callers that only want the repository verdict.
+    include_dependencies: bool = True
 
 
 def parse_package_json(raw: str) -> list[Dependency]:
@@ -128,3 +136,88 @@ async def migrate(req: MigrateRequest):
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
     return {"diff": result.diff, "explanation": result.explanation}
+
+
+# A repo's package.json is frequently much larger than a hand-pasted one — Express
+# alone carries 44 entries. Analysing every one would mean 44+ LLM calls behind a
+# single click, so the manifest is truncated to the runtime dependencies that carry
+# the most weight, and the response says plainly what was left out.
+#
+# Matches MAX_DEPENDENCIES so a repo scan covers as much as a pasted package.json.
+MAX_REPO_DEPENDENCIES = 25
+
+
+def _select_dependencies(deps: list[dict]) -> tuple[list[Dependency], int]:
+    """Runtime dependencies first — devDependencies rarely ship to production."""
+    ordered = [d for d in deps if not d["dev"]] + [d for d in deps if d["dev"]]
+    chosen = ordered[:MAX_REPO_DEPENDENCIES]
+    return [Dependency(name=d["name"], version=d["version"]) for d in chosen], len(deps) - len(chosen)
+
+
+def _summarise_dependencies(results: list[dict]) -> dict:
+    """Roll per-package verdicts up into the counts the health rubric scores against."""
+    scored = [r for r in results if r.get("risk_category")]
+    counts = {"analyzed": len(scored), "high": 0, "medium": 0, "low": 0}
+    for r in scored:
+        counts[r["risk_category"].lower()] += 1
+    counts["riskiest"] = max(
+        (r for r in scored), key=lambda r: r.get("risk_score", -1), default=None
+    )
+    counts["riskiest"] = counts["riskiest"]["name"] if counts["riskiest"] else None
+    return counts
+
+
+@app.post("/analyze-repo")
+async def analyze_repo(req: RepoRequest):
+    """Score a GitHub repository 0-100 for health and report why.
+
+    Higher is healthier here — the inverse of the per-package risk scores in the
+    same response, which keep their original direction. Both are labelled.
+    """
+    repo = parse_repo_input(req.repo_url)
+    if not repo:
+        raise HTTPException(
+            status_code=400,
+            detail="Could not read that as a GitHub repository. Try https://github.com/owner/repo or owner/repo.",
+        )
+    owner, name = repo
+
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        signals = await collect_repo_signals(client, owner, name)
+
+        if signals.get("exists") is False:
+            raise HTTPException(
+                status_code=404,
+                detail=f"{owner}/{name} does not exist, or is private and this token cannot see it.",
+            )
+        if signals.get("exists") is None:
+            raise HTTPException(
+                status_code=502,
+                detail="GitHub could not be reached. Check the network, or the GITHUB_TOKEN rate limit.",
+            )
+
+        dependencies: list[dict] = []
+        omitted = 0
+        if req.include_dependencies and signals.get("dependencies"):
+            selected, omitted = _select_dependencies(signals["dependencies"])
+            dependencies = list(
+                await asyncio.gather(*(analyze_one(client, d) for d in selected))
+            )
+            dependencies.sort(key=lambda r: r.get("risk_score", -1), reverse=True)
+
+        dep_summary = _summarise_dependencies(dependencies) if dependencies else None
+        health = await assess_repo_health(signals, dep_summary)
+
+    # The raw dependency list is an implementation detail of the manifest fetch; the
+    # analysed results below carry everything the client needs.
+    signals.pop("dependencies", None)
+
+    return {
+        "repo": signals.get("resolved_repo") or f"{owner}/{name}",
+        "url": f"https://github.com/{owner}/{name}",
+        **health,
+        "signals": signals,
+        "dependencies": dependencies,
+        "dependency_summary": dep_summary,
+        "dependencies_omitted": omitted,
+    }

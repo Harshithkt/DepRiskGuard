@@ -648,3 +648,517 @@ async def generate_migration(snippet: str) -> MigrationResult:
     return await _invoke_structured(
         MigrationResult, MIGRATION_PROMPT.format(snippet=snippet), max_tokens=8000, disable_thinking=False
     )
+
+
+# --- Repository health ---------------------------------------------------------
+# The package rubric above scores RISK: 0 is good, 100 is alarming, and a signal
+# that never arrived contributes 0 — the benign reading.
+#
+# Health runs the other way: 100 is good, and 0 points means "earned no credit".
+# So the same missing-signal rule would quietly punish a healthy repo for GitHub
+# having rate-limited us. _Pillar fixes that by tracking `available` — the credit
+# actually on offer given what we could measure — separately from `earned`. An
+# unmeasurable criterion is dropped from both, so the score is always a percentage
+# of what was knowable, never of what was hoped for.
+
+HEALTH_BOUNDS = ((39, "Poor"), (59, "Fair"), (79, "Good"), (100, "Excellent"))
+
+
+def categorise_health(score: int) -> str:
+    for upper, label in HEALTH_BOUNDS:
+        if score <= upper:
+            return label
+    return "Excellent"
+
+
+class _Pillar:
+    """One themed group of health criteria, scored as earned-out-of-available."""
+
+    def __init__(self, key: str, label: str, weight: int):
+        self.key = key
+        self.label = label
+        self.weight = weight
+        self.earned = 0
+        self.available = 0
+        self.items: list[dict] = []
+
+    def score(self, earned: int, maximum: int, reason: str) -> None:
+        self.earned += earned
+        self.available += maximum
+        self.items.append({"points": earned, "max": maximum, "reason": reason})
+
+    def unknown(self, reason: str) -> None:
+        """Data source did not answer. Excluded from the ratio entirely."""
+        self.items.append({"points": None, "max": None, "reason": reason})
+
+    @property
+    def percentage(self) -> int | None:
+        if self.available <= 0:
+            return None
+        return round(self.earned / self.available * 100)
+
+    def as_dict(self) -> dict:
+        return {
+            "key": self.key,
+            "label": self.label,
+            "weight": self.weight,
+            "earned": self.earned,
+            "available": self.available,
+            "percentage": self.percentage,
+            "items": self.items,
+        }
+
+
+def _banded(value: int | None, bands: list[tuple[int, int]]) -> int:
+    """Points for the first band whose ceiling `value` falls under. 0 if it exceeds all."""
+    if value is None:
+        return 0
+    for ceiling, points in bands:
+        if value <= ceiling:
+            return points
+    return 0
+
+
+def _banded_desc(value: int | None, bands: list[tuple[int, int]]) -> int:
+    """Points for the first band whose floor `value` meets. 0 if it falls under all."""
+    if value is None:
+        return 0
+    for floor, points in bands:
+        if value >= floor:
+            return points
+    return 0
+
+
+# (ceiling in days, points) ascending — fresher is better.
+COMMIT_RECENCY = [(30, 12), (90, 10), (180, 7), (365, 4), (730, 1)]
+RELEASE_RECENCY = [(90, 5), (365, 4), (730, 2)]
+ISSUE_CLOSE_SPEED = [(7, 5), (30, 4), (90, 2), (365, 1)]
+
+# (floor, points) descending — more is better.
+COMMIT_VOLUME = [(100, 9), (30, 7), (10, 5), (3, 3), (1, 1)]
+RELEASE_CADENCE = [(12, 4), (6, 3), (3, 2), (1, 1)]
+CONTRIBUTOR_COUNT = [(100, 10), (30, 8), (10, 6), (3, 4), (2, 2)]
+ADOPTION_STARS = [(10_000, 7), (1_000, 5), (100, 3), (10, 1)]
+
+# (ceiling %, points) ascending — a lower share of commits by one person is better.
+BUS_FACTOR = [(30, 8), (50, 6), (70, 4), (90, 2)]
+
+VULN_PENALTY = {"CRITICAL": 0, "HIGH": 2, "MODERATE": 5, "LOW": 7}
+
+# A weighted mean lets a dead project hide behind its own history. `request` has
+# 25k stars, 268 contributors and complete governance docs, all of which are real —
+# and all of which describe 2015. Averaged flat it scored 51/100 "Fair" despite not
+# having taken a commit in 2,382 days, which is not a defensible thing to tell
+# someone deciding whether to depend on it.
+#
+# So maintenance acts as a ceiling on the whole score, not just a term in it.
+# Documentation and past popularity cannot make an abandoned project healthy; they
+# can only make a maintained one better. (maintenance % ceiling, overall cap)
+MAINTENANCE_CEILING = [(10, 30), (25, 45), (50, 65)]
+
+
+def baseline_health(signals: dict, dep_summary: dict | None = None) -> tuple[int, list[dict]]:
+    """Score a repository 0-100 for health, higher being better.
+
+    Returns the score and the four pillar breakdowns. `dep_summary` carries the
+    outcome of running the package rubric over the repo's own package.json; when
+    the repo has no manifest that criterion is dropped rather than zeroed.
+    """
+    archived = signals.get("archived")
+    disabled = signals.get("disabled")
+
+    maintenance = _Pillar("maintenance", "Maintenance", 35)
+    community = _Pillar("community", "Community", 25)
+    security = _Pillar("security", "Security", 20)
+    governance = _Pillar("governance", "Governance", 20)
+
+    # --- Maintenance -----------------------------------------------------------
+    if archived or disabled:
+        state = "archived" if archived else "disabled"
+        # Decisive, not a deduction: a read-only repo cannot be actively maintained
+        # no matter how good its commit history looks.
+        maintenance.score(0, 31, f"Repository is {state} — no further work can land here")
+    else:
+        commit_days = signals.get("days_since_last_commit")
+        if commit_days is None:
+            maintenance.unknown("Last commit date unavailable")
+        else:
+            maintenance.score(
+                _banded(commit_days, COMMIT_RECENCY), 12, f"Last commit {commit_days}d ago"
+            )
+
+        commits_90d = signals.get("commits_last_90d")
+        if commits_90d is None:
+            maintenance.unknown("Commit volume unavailable")
+        else:
+            maintenance.score(
+                _banded_desc(commits_90d, COMMIT_VOLUME), 9,
+                f"{commits_90d} commits in the last 90 days",
+            )
+
+        release_days = signals.get("days_since_last_release")
+        releases = signals.get("releases_total")
+        if release_days is None and releases is None:
+            maintenance.unknown("No GitHub releases published (may ship via npm tags only)")
+        else:
+            points = _banded(release_days, RELEASE_RECENCY)
+            detail = f"Last release {release_days}d ago" if release_days is not None else "No dated release found"
+            maintenance.score(points, 5, detail)
+            cadence = _banded_desc(releases, RELEASE_CADENCE) if releases else 0
+            maintenance.score(cadence, 4, f"{releases or 0} releases published in total")
+
+    close_days = signals.get("median_issue_close_days")
+    if close_days is None:
+        maintenance.unknown("Not enough closed issues to measure responsiveness")
+    else:
+        sampled = signals.get("closed_issues_sampled")
+        maintenance.score(
+            _banded(close_days, ISSUE_CLOSE_SPEED), 5,
+            f"Median {close_days}d to close an issue (last {sampled} sampled)",
+        )
+
+    # --- Community -------------------------------------------------------------
+    contributors = signals.get("contributors")
+    if contributors is None:
+        community.unknown("Contributor count unavailable")
+    else:
+        community.score(
+            _banded_desc(contributors, CONTRIBUTOR_COUNT), 10, f"{contributors} contributors"
+        )
+
+    share = signals.get("top_contributor_share")
+    if share is None:
+        community.unknown("Contribution spread unavailable")
+    else:
+        community.score(
+            _banded(share, BUS_FACTOR), 8,
+            f"Top contributor authored {share}% of commits"
+            + (" — single point of failure" if share > 70 else ""),
+        )
+
+    stars = signals.get("stars")
+    if stars is None:
+        community.unknown("Star count unavailable")
+    else:
+        community.score(_banded_desc(stars, ADOPTION_STARS), 7, f"{stars:,} stars")
+
+    # --- Security --------------------------------------------------------------
+    vulns = signals.get("open_vulnerabilities")
+    severity = signals.get("max_vulnerability_severity")
+    if vulns is None:
+        security.unknown("Advisory data unavailable")
+    elif vulns == 0:
+        security.score(10, 10, "No open advisories against this package on OSV.dev")
+    else:
+        security.score(
+            VULN_PENALTY.get(severity or "", 5), 10,
+            f"{vulns} open {'advisory' if vulns == 1 else 'advisories'} on OSV.dev"
+            f" (worst: {severity or 'unrated'})",
+        )
+
+    has_policy = signals.get("has_security_policy")
+    if has_policy is None:
+        security.unknown("Community profile unavailable")
+    else:
+        security.score(
+            4 if has_policy else 0, 4,
+            "SECURITY.md tells researchers how to report" if has_policy
+            else "No SECURITY.md — no documented disclosure route",
+        )
+
+    if dep_summary and dep_summary.get("analyzed"):
+        high = dep_summary.get("high", 0)
+        medium = dep_summary.get("medium", 0)
+        if high == 0 and medium == 0:
+            points, detail = 6, "No dependency scored above Low risk"
+        elif high == 0:
+            points, detail = 4, f"{medium} dependencies at Medium risk, none High"
+        elif high == 1:
+            points, detail = 2, "1 dependency at High risk"
+        else:
+            points, detail = 0, f"{high} dependencies at High risk"
+        security.score(points, 6, detail)
+    else:
+        security.unknown("Dependencies not analysed — no package.json to read")
+
+    # --- Governance ------------------------------------------------------------
+    licence = signals.get("license")
+    governance.score(
+        6 if licence else 0, 6,
+        f"{licence} licensed" if licence else "No license — legally unsafe to depend on",
+    )
+
+    docs = (
+        ("has_readme", 4, "README"),
+        ("has_contributing", 3, "CONTRIBUTING guide"),
+        ("has_code_of_conduct", 2, "Code of conduct"),
+        ("has_issue_template", 2, "Issue template"),
+        ("has_pr_template", 2, "Pull request template"),
+    )
+    for key, weight, label in docs:
+        present = signals.get(key)
+        if present is None:
+            governance.unknown(f"{label} presence unavailable")
+        else:
+            governance.score(weight if present else 0, weight,
+                             f"{label} present" if present else f"{label} missing")
+
+    described = bool(signals.get("description")) and bool(signals.get("topics"))
+    governance.score(1 if described else 0, 1,
+                     "Described and tagged with topics" if described
+                     else "Missing a description or topics")
+
+    pillars = [maintenance, community, security, governance]
+
+    # Weighted mean across pillars that produced a measurable ratio. Dropping an
+    # unmeasurable pillar from the denominator keeps the score honest rather than
+    # letting an outage read as neglect.
+    # Score on total points earned over total points *offered*, rather than averaging
+    # the four pillar percentages. Each pillar's declared weight is exactly its maximum
+    # points (35/25/20/20 = 100), so this preserves the intended balance while making a
+    # partly-measurable pillar count for only as much as it could actually measure.
+    #
+    # Averaging the percentages got this wrong: React's security pillar came down to a
+    # single 4-point check for SECURITY.md, scored 0%, and that 0 then carried the full
+    # weight of 20 — one missing file dragging the repo as hard as a stack of unpatched
+    # CVEs would have. Here it costs the 4 points it is actually worth.
+    total_available = sum(p.available for p in pillars)
+    if total_available <= 0:
+        return 0, [p.as_dict() for p in pillars], None
+    overall = round(sum(p.earned for p in pillars) / total_available * 100)
+
+    ceiling_note = None
+    if maintenance.percentage is not None:
+        for threshold, cap in MAINTENANCE_CEILING:
+            if maintenance.percentage <= threshold and overall > cap:
+                reason = (
+                    "archived" if (archived or disabled)
+                    else f"maintenance at {maintenance.percentage}%"
+                )
+                ceiling_note = (
+                    f"Capped at {cap} — {reason}. Community standing and documentation "
+                    f"describe the project's past, not whether it is still being kept up."
+                )
+                overall = cap
+                break
+
+    return max(0, min(100, overall)), [p.as_dict() for p in pillars], ceiling_note
+
+
+class RepoHealthAssessment(BaseModel):
+    """Reviewed health verdict for a GitHub repository."""
+
+    health_score: int = Field(description="Final health score 0-100 where 100 is excellent, starting from the supplied rubric baseline and adjusted by at most 15 points in either direction.")
+    summary: str = Field(description="EXACTLY ONE sentence, under 200 characters, plain text with no markdown, characterising the overall state of this repository.")
+    strengths: list[str] = Field(description="Up to 4 short phrases, each under 100 characters, naming what this project genuinely does well. Plain text, no markdown, no leading dashes. Empty list if there is nothing positive to say.")
+    concerns: list[str] = Field(description="Up to 4 short phrases, each under 100 characters, naming what would worry someone depending on this repository. Plain text, no markdown, no leading dashes. Empty list if there is nothing to flag.")
+    outlook: str = Field(description="EXACTLY ONE sentence, under 200 characters, plain text, predicting the state of this repository over the NEXT 6 MONTHS.")
+    justification: str = Field(description="AT MOST 3 sentences, under 500 characters, plain text with no markdown. Cite the specific signal numbers that drove the score and name the reason for any adjustment away from the baseline.")
+
+
+REPO_HEALTH_PROMPT = """You are assessing the health of a GitHub repository for a team \
+deciding whether to depend on it, contribute to it, or adopt it.
+
+Repository: {repo} {description}
+Primary language: {language} | Age: {age_days} days | Fork of another repo: {is_fork}
+
+SIGNALS (a value of "unknown" means the data source did not return it — never treat \
+unknown as bad news):
+
+Maintenance
+- Archived (read-only): {archived}
+- Days since last commit: {days_since_last_commit}
+- Commits in the last 90 days: {commits_last_90d}
+- Days since last release: {days_since_last_release}
+- Total releases published: {releases_total}
+- Median days to close an issue: {median_issue_close_days}
+
+Community
+- Contributors: {contributors}
+- Share of commits by the single top contributor: {top_contributor_share}%
+- Stars: {stars} | Forks: {forks} | Watchers: {watchers}
+- Open issues and PRs combined: {open_issues_and_prs}
+
+Security
+- Open advisories against this package on OSV.dev: {open_vulnerabilities} (worst: {max_vulnerability_severity})
+- SECURITY.md present: {has_security_policy}
+- Its own dependencies: {dep_line}
+
+Governance
+- License: {license}
+- GitHub community health score (0-100): {community_health_percentage}
+- README: {has_readme} | CONTRIBUTING: {has_contributing} | Code of conduct: {has_code_of_conduct}
+
+A fixed rubric has already scored these signals into four weighted pillars. This is \
+the baseline — note that HIGHER IS HEALTHIER on this scale, the opposite of a risk score:
+
+BASELINE HEALTH: {baseline}/100
+{pillars}{ceiling_note}
+
+YOUR TASK — adjust the baseline, do not re-derive it:
+The rubric measures what is countable. Your job is to apply what you know about THIS \
+SPECIFIC project that counting cannot show, and move the score by AT MOST {band} points \
+in either direction. Set health_score between {floor} and {ceiling}.
+
+Adjust DOWN when you know something the signals miss: the project has been superseded \
+by an official successor, its maintainers have announced they are stepping back, it has \
+a history of supply-chain or governance incidents, or its activity is bot noise rather \
+than real work.
+
+Adjust UP when the rubric is being unfair: the project is small, complete and genuinely \
+finished (stability is not neglect), it is a specification or reference implementation \
+where a slow cadence is correct, or it is backed by an organisation whose support is not \
+visible in commit counts.
+
+Keep the baseline when you have nothing specific to add. An unchanged score is the \
+correct answer more often than not — do not invent a reason to move it.
+
+Write strengths and concerns as concrete, specific phrases that cite real numbers from \
+above — "328 contributors, no single point of failure" not "good community". Do not pad \
+either list to reach four items.
+
+LENGTH LIMITS — these render in a compact report and are enforced by truncation:
+- summary and outlook: EXACTLY ONE sentence each, under 200 characters.
+- strengths and concerns: at most 4 entries each, under 100 characters per entry.
+- justification: AT MOST 3 sentences, under 500 characters.
+Write as plain prose. No markdown, no **bold**, no bullet points, no headings."""
+
+
+def _format_pillars(pillars: list[dict]) -> str:
+    """The pillar breakdown as the model sees it, including what could not be measured."""
+    lines = []
+    for pillar in pillars:
+        if pillar["percentage"] is None:
+            lines.append(f"  {pillar['label']} (weight {pillar['weight']}): NOT MEASURABLE — excluded from the score")
+        else:
+            lines.append(
+                f"  {pillar['label']} (weight {pillar['weight']}): "
+                f"{pillar['earned']}/{pillar['available']} = {pillar['percentage']}%"
+            )
+        for item in pillar["items"]:
+            if item["points"] is None:
+                lines.append(f"      ?   {item['reason']}")
+            else:
+                lines.append(f"      {item['points']:>2}/{item['max']:<2} {item['reason']}")
+    return "\n".join(lines)
+
+
+# Open-weight models occasionally emit the schema's own placeholder rather than
+# filling it in — MiniMax-M3 returned "..." for every prose field on one run here.
+# Left alone that renders as a blank report that looks like a backend failure.
+_PLACEHOLDER = re.compile(r"^[\s.…\-–—*_]*$")
+
+
+def _is_placeholder(text: str) -> bool:
+    return bool(_PLACEHOLDER.match(text or ""))
+
+
+def _clean_list(values: list[str] | None, limit: int) -> list[str]:
+    """Trim a model-authored bullet list to something a compact panel can render."""
+    out = []
+    for value in values or []:
+        if not isinstance(value, str):
+            continue
+        # Models reliably prepend "- " or "• " despite being told not to.
+        text = _tidy(value.lstrip("-•* ").strip(), max_chars=110, max_sentences=2)
+        if text and not _is_placeholder(text):
+            out.append(text)
+        if len(out) == limit:
+            break
+    return out
+
+
+async def assess_repo_health(signals: dict, dep_summary: dict | None = None) -> dict:
+    """Score one repository: deterministic pillar rubric, then a bounded LLM review."""
+    baseline, pillars, ceiling_note = baseline_health(signals, dep_summary)
+    floor, ceiling = max(0, baseline - ADJUSTMENT_BAND), min(100, baseline + ADJUSTMENT_BAND)
+
+    if dep_summary and dep_summary.get("analyzed"):
+        dep_line = (
+            f"{dep_summary['analyzed']} analysed — "
+            f"{dep_summary.get('high', 0)} High risk, {dep_summary.get('medium', 0)} Medium risk"
+        )
+    else:
+        dep_line = "not analysed (no package.json found at the repository root)"
+
+    description = f"— {signals['description']}" if signals.get("description") else ""
+    prompt = REPO_HEALTH_PROMPT.format(
+        repo=signals.get("resolved_repo") or "unknown",
+        description=description,
+        language=_fmt(signals.get("language")),
+        age_days=_fmt(signals.get("age_days")),
+        is_fork=_fmt(signals.get("is_fork")),
+        archived=_fmt(signals.get("archived")),
+        days_since_last_commit=_fmt(signals.get("days_since_last_commit")),
+        commits_last_90d=_fmt(signals.get("commits_last_90d")),
+        days_since_last_release=_fmt(signals.get("days_since_last_release")),
+        releases_total=_fmt(signals.get("releases_total")),
+        median_issue_close_days=_fmt(signals.get("median_issue_close_days")),
+        contributors=_fmt(signals.get("contributors")),
+        top_contributor_share=_fmt(signals.get("top_contributor_share")),
+        stars=_fmt(signals.get("stars")),
+        forks=_fmt(signals.get("forks")),
+        watchers=_fmt(signals.get("watchers")),
+        open_issues_and_prs=_fmt(signals.get("open_issues_and_prs")),
+        open_vulnerabilities=_fmt(signals.get("open_vulnerabilities")),
+        max_vulnerability_severity=_fmt(signals.get("max_vulnerability_severity")),
+        has_security_policy=_fmt(signals.get("has_security_policy")),
+        dep_line=dep_line,
+        license=_fmt(signals.get("license")),
+        community_health_percentage=_fmt(signals.get("community_health_percentage")),
+        has_readme=_fmt(signals.get("has_readme")),
+        has_contributing=_fmt(signals.get("has_contributing")),
+        has_code_of_conduct=_fmt(signals.get("has_code_of_conduct")),
+        baseline=baseline,
+        pillars=_format_pillars(pillars),
+        ceiling_note=f"\n\n  CEILING APPLIED: {ceiling_note}" if ceiling_note else "",
+        band=ADJUSTMENT_BAND,
+        floor=floor,
+        ceiling=ceiling,
+    )
+
+    result: RepoHealthAssessment = await _invoke_structured(
+        RepoHealthAssessment, prompt, max_tokens=2000, disable_thinking=True
+    )
+
+    # Same clamp as assess_risk: hold the model to the band it was given rather than
+    # trusting a score it may have invented from scratch.
+    score = max(floor, min(ceiling, result.health_score))
+
+    summary = _tidy(result.summary, max_chars=220, max_sentences=1)
+    outlook = _tidy(result.outlook, max_chars=220, max_sentences=1)
+    justification = _tidy(result.justification, max_chars=520, max_sentences=3)
+
+    # If the model gave us nothing usable, say what the rubric found rather than
+    # rendering an empty panel the user would read as a broken backend.
+    weakest = min(
+        (p for p in pillars if p["percentage"] is not None),
+        key=lambda p: p["percentage"], default=None,
+    )
+    if _is_placeholder(summary):
+        summary = (
+            f"{signals.get('resolved_repo', 'This repository')} scores "
+            f"{score}/100 ({categorise_health(score)}) against the health rubric."
+        )
+    if _is_placeholder(outlook):
+        outlook = "The model did not return an outlook; the rubric score above stands on its own."
+    if _is_placeholder(justification):
+        justification = (
+            f"Rubric baseline {baseline}/100"
+            + (f", weakest pillar {weakest['label']} at {weakest['percentage']}%." if weakest else ".")
+            + " The model returned no usable commentary on this run."
+        )
+
+    return {
+        "health_score": score,
+        # Derived, never model-authored — score and label cannot contradict each other.
+        "health_category": categorise_health(score),
+        "baseline_score": baseline,
+        "pillars": pillars,
+        "ceiling_note": ceiling_note,
+        "summary": summary,
+        "strengths": _clean_list(result.strengths, limit=4),
+        "concerns": _clean_list(result.concerns, limit=4),
+        "outlook": outlook,
+        "justification": justification,
+    }
