@@ -3,10 +3,6 @@
 Paste a `package.json`, get a **6-month forward risk forecast** for every dependency and a
 **recommended alternative** for the risky ones.
 
-> **Setting it up?** See **[GUIDE.md](GUIDE.md)** — prerequisites, provider keys, run
-> commands, verification and troubleshooting. This README covers what the tool does
-> and how the scoring works.
-
 ## What it does, in plain language
 
 Tools like Snyk, Dependabot and OSV-Scanner tell you a package is *already* broken —
@@ -47,6 +43,40 @@ The score is **not** free-form LLM output. It's computed in two stages:
 The UI shows the whole derivation: every rubric line, the baseline, and the model's
 adjustment. If the model moves a score, you can see by how much and read its reason.
 
+### Repository health
+
+`POST /analyze-repo` takes a GitHub repo — the browser URL, the clone string, or bare
+`owner/repo` — and scores it **0-100 where higher is healthier**. This is the inverse of
+the per-package risk score, which stays 0-100 where higher is worse; the API and the UI
+label both directions everywhere they appear.
+
+Four weighted pillars, summing to 100 points:
+
+| Pillar | Points | What it measures |
+| --- | --- | --- |
+| Maintenance | 35 | Commit recency and volume, release recency and cadence, median issue close time |
+| Community | 25 | Contributor count, share of commits by the top contributor, stars |
+| Security | 20 | Open advisories against the published version, SECURITY.md, risk of its own dependencies |
+| Governance | 20 | License, README, CONTRIBUTING, code of conduct, issue and PR templates, description |
+
+Two details do real work here:
+
+**Missing data is excluded, not zeroed.** On a risk score an absent signal contributing
+zero is the benign reading. On a health score zero means "earned no credit", so the same
+rule would let a GitHub outage read as neglect. Each pillar therefore tracks the points
+actually *available* given what could be measured, and the score is earned-over-available.
+A pillar nothing could be measured for drops out of the denominator entirely.
+
+**Maintenance caps the total.** A flat weighted mean let `request` — deprecated, no commit
+in 2,382 days — score 51/100 "Fair" on the strength of 25k stars and complete docs, which
+are real but describe 2015. Maintenance below 50% now caps the whole score (below 10% caps
+it at 30), because documentation and past popularity cannot make an abandoned project
+healthy. `request` scores 30 "Poor"; `expressjs/express` is untouched at 86.
+
+When the repo has a `package.json` at its root, its dependencies are run through the risk
+rubric above and the result feeds the Security pillar. Runtime dependencies are analysed
+first and the list is capped — the response says how many were left out.
+
 ### Where alternatives come from
 
 Any package scoring **High or Medium** gets a replacement recommendation. Low-risk
@@ -75,28 +105,6 @@ once in testing (`modern-tar` proposed for `gulp`). This is why the UI prints np
 one-line description next to every agent suggestion: if the description does not match
 what you need, disregard the suggestion. Curated pairs are not subject to this failure.
 
-## Honest scope notes
-
-This is a **2-day proof-of-concept**, and it's worth being blunt about what it is:
-
-- **The rubric weights are hand-chosen, not learned.** There is no ML model, no training
-  data, no backtested accuracy. The weights are a considered opinion about what predicts
-  trouble, and the ±15 band on top is model judgment. Treat a score as a structured,
-  auditable argument, not a calibrated probability. The upside of the rubric is that the
-  argument is fully visible and reproducible — you can disagree with a specific line.
-- **Agent-suggested alternatives are verified for health, not for fit.** The npm check
-  rules out invented, deprecated and abandoned packages, which is most of the failure
-  modes — but a real, healthy, irrelevant suggestion will still get through. Read the npm
-  description shown beside it. Quality here depends heavily on the model: expect more junk
-  candidates from a small open-weight model than from Claude.
-- **npm only.** No PyPI, Maven, Go modules, etc.
-- **Signals can be missing, and that moves scores.** If GitHub rate-limits you, `archived`
-  and the commit/health signals come back `unknown`. Nothing treats unknown as bad, so the
-  score comes out *lower* rather than wrong-in-both-directions — but it does mean the same
-  package can score differently across runs when you are rate-limited. Set a `GITHUB_TOKEN`
-  for stable scoring; this is the single biggest source of run-to-run variance.
-- **The `moment` → `date-fns` migration endpoint still exists** at `POST /migrate`, but it
-  is no longer surfaced in the UI.
 
 ## Setup
 
@@ -193,6 +201,16 @@ curl -X POST http://127.0.0.1:8000/analyze \
   -H 'Content-Type: application/json' \
   -d '{"dependencies":[{"name":"moment","version":"^2.29.4"}]}'
 
+# Repository health report (higher is better — the inverse of the risk scores above)
+curl -X POST http://127.0.0.1:8000/analyze-repo \
+  -H 'Content-Type: application/json' \
+  -d '{"repo_url": "https://github.com/expressjs/express"}'
+
+# Repository verdict only, skipping the per-dependency pass
+curl -X POST http://127.0.0.1:8000/analyze-repo \
+  -H 'Content-Type: application/json' \
+  -d '{"repo_url": "expressjs/express", "include_dependencies": false}'
+
 # Migration diff
 curl -X POST http://127.0.0.1:8000/migrate \
   -H 'Content-Type: application/json' \
@@ -212,14 +230,14 @@ cd depriskguard-backend
 agent.yaml                     # the deliverable config
 README.md
 depriskguard-backend/
-  main.py                      # FastAPI app, CORS, /analyze + /migrate
-  signals.py                   # raw signals from GitHub / npm / OSV, + npm health check
-  agent.py                     # scoring rubric, alternatives agent, provider wiring
+  main.py                      # FastAPI app, CORS, /analyze + /analyze-repo + /migrate
+  signals.py                   # raw signals from GitHub / npm / OSV, package + repository
+  agent.py                     # risk rubric, health rubric, alternatives agent, providers
   test_api.py                  # end-to-end smoke test
   requirements.txt
   .env.example
 depriskguard-frontend/
-  src/App.tsx                  # the single page (2 sections)
+  src/App.tsx                  # the single page (repo scan / package.json tabs)
   src/api.ts                   # typed fetch helpers
   src/index.css                # Claude-inspired light palette as Tailwind v4 tokens
 ```

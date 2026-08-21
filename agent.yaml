@@ -29,15 +29,26 @@ tech_stack:
   frontend: React + Vite + TypeScript + Tailwind CSS
 
 signals:
+  # Package-level
   - Days since last GitHub commit
   - Days since last npm release
   - GitHub community health_percentage score
   - Number of open vulnerabilities from OSV.dev
   - Weekly npm download count
+  # Repository-level (health)
+  - Commit volume over a 90-day window
+  - Contributor count and share of commits held by the top contributor
+  - Median days to close an issue
+  - Release cadence and total releases published
+  - License, README, CONTRIBUTING, code of conduct, issue/PR templates, SECURITY.md
 
 endpoints:
   - POST /analyze — accepts package.json content (or a list of {name, version}),
     returns a risk report per dependency with an alternative where one is mapped
+  - POST /analyze-repo — accepts a GitHub repo URL (browser, clone string or bare
+    owner/repo), returns a 0-100 repository HEALTH score (higher is better, the
+    inverse of the risk scale), a four-pillar breakdown, strengths and concerns,
+    and the risk report for the dependencies in its package.json
   - POST /migrate — accepts a moment-based code snippet, returns a before/after
     diff plus an explanation
 
@@ -62,7 +73,9 @@ env:
 scope_notes: >
   This is a 2-day proof-of-concept. Risk forecasting uses LLM reasoning over 5 real
   signals (GitHub activity, OSV vulnerabilities, npm download trends), not a trained
-  ML model. Alternative recommendations use a small hardcoded lookup table, not dynamic
-  discovery. Migration demo is limited to the moment -> date-fns package pair for
+  ML model. Repository health uses the same shape — a fixed four-pillar rubric with a
+  bounded model adjustment — and deliberately excludes unmeasurable signals from its
+  denominator so an API outage cannot read as neglect. Alternative recommendations use a
+  small hardcoded lookup table, not dynamic discovery. Migration demo is limited to the moment -> date-fns package pair for
   reliability. npm is the only supported ecosystem. No Docker, no MCP server, no
   sandboxing, no public tunnel — it runs locally with two terminal commands.
